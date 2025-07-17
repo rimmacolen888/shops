@@ -1,7 +1,8 @@
 const { Telegraf, Markup } = require('telegraf');
-const { syncModels, User, Product, Purchase, Admin } = require('./models');
+const { syncModels, User, Product, Purchase, Admin, ReservedLine } = require('./models');
 const fs = require('fs').promises;
 const path = require('path');
+const LineReservationManager = require('./utils/lineReservation');
 require('dotenv').config();
 
 // Проверка переменных окружения
@@ -195,9 +196,17 @@ async function createMainMenu(userId) {
       }
     });
 
+    const hasReservedLines = await ReservedLine.findOne({
+      where: {
+        userId: userId,
+        status: 'reserved',
+        reservedUntil: { [require('sequelize').Op.gt]: new Date() }
+      }
+    });
+
     const userState = userStates.get(userId);
     const hasAdminProcess = userState && (userState.state === 'admin_list_sent' || userState.state === 'admin_file_sent');
-    const hasShopProcess = userState && (userState.state === 'shop_list_sent' || userState.state === 'shop_file_sent');
+    const hasShopProcess = userState && (userState.state === 'shop_list_sent' || userState.state === 'shop_file_sent' || userState.state === 'shop_lines_reserved');
 
     const buttons = [
       [Markup.button.callback('🛍️ Купить Shop', 'buy_shop')],
@@ -208,8 +217,13 @@ async function createMainMenu(userId) {
     ];
 
     // Показываем кнопку "Товар куплен" только если есть активная покупка
-    if (hasActiveReservation || hasPendingPurchase || hasAdminProcess || hasShopProcess) {
+    if (hasActiveReservation || hasPendingPurchase || hasAdminProcess || hasShopProcess || hasReservedLines) {
       buttons.push([Markup.button.callback('💰 Товар куплен', 'purchase_completed')]);
+    }
+
+    // Показываем кнопку резерва если есть зарезервированные строки
+    if (hasReservedLines) {
+      buttons.push([Markup.button.callback('📋 Мои резервы', 'show_reserved_lines')]);
     }
 
     buttons.push([Markup.button.callback('🆘 Поддержка', 'support')]);
@@ -229,72 +243,6 @@ async function createMainMenu(userId) {
   }
 }
 
-// Функция обработки строк файла - скрытие логинов/паролей
-function processFileLines(fileContent, hideCredentials = true) {
-  const lines = fileContent.split('\n').filter(line => line.trim());
-  
-  if (!hideCredentials) {
-    return lines; // Возвращаем полные строки с логинами/паролями
-  }
-  
-  // Скрываем логины/пароли для показа покупателю
-  return lines.map(line => {
-    const parts = line.split(':');
-    if (parts.length >= 4) {
-      // Берем URL (первая часть) и информацию о заказах (все после 3-го двоеточия)
-      const url = parts[0];
-      const ordersInfo = parts.slice(3).join(':');
-      return `${url} ${ordersInfo}`;
-    }
-    return line; // Если формат не подходит, возвращаем как есть
-  });
-}
-
-// Функция поиска строк в файле
-function findLinesInFile(fileContent, selectedLines) {
-  const fullLines = fileContent.split('\n').filter(line => line.trim());
-  const processedLines = processFileLines(fileContent, true);
-  const foundLines = [];
-  
-  selectedLines.forEach(selectedLine => {
-    const selectedTrimmed = selectedLine.trim();
-    const index = processedLines.findIndex(processedLine => 
-      processedLine.trim() === selectedTrimmed
-    );
-    
-    if (index !== -1) {
-      foundLines.push({
-        original: fullLines[index],
-        processed: processedLines[index],
-        index: index
-      });
-    }
-  });
-  
-  return foundLines;
-}
-
-// Функция удаления строк из файла
-async function removeServerLinesFromFile(filePath, linesToRemove) {
-  try {
-    const fileContent = await fs.readFile(filePath, 'utf8');
-    const lines = fileContent.split('\n').filter(line => line.trim());
-    
-    // Удаляем выбранные строки
-    const remainingLines = lines.filter(line => 
-      !linesToRemove.some(removeIndex => lines[removeIndex] === line)
-    );
-    
-    // Записываем обновленный файл
-    await fs.writeFile(filePath, remainingLines.join('\n'), 'utf8');
-    console.log(`📝 Обновлен файл ${filePath}, удалено ${linesToRemove.length} строк`);
-    
-    return remainingLines.length;
-  } catch (error) {
-    console.error('Ошибка обновления файла:', error);
-    throw error;
-  }
-}
 function getUserStatus(weeklySpent) {
   if (weeklySpent >= 8000) return 'INFINITY';
   if (weeklySpent >= 5000) return 'PREMIUM';
@@ -326,12 +274,29 @@ async function confirmSaleByAdmin(ctx, buyer, amount) {
   try {
     console.log(`🏪 Подтверждение продажи админом ${ctx.from.id} для пользователя ${buyer.telegramId} на сумму $${amount}`);
     
+    // Проверяем, есть ли зарезервированные строки
+    const reservedLines = await ReservedLine.findAll({
+      where: {
+        userId: buyer.telegramId,
+        status: 'reserved'
+      },
+      include: [Product]
+    });
+
     const newWeeklySpent = parseFloat(buyer.weeklySpent || 0) + amount;
     const newTotalSpent = parseFloat(buyer.totalSpent || 0) + amount;
     
     const oldStatus = buyer.status;
     const newStatus = getUserStatus(newWeeklySpent);
-    const statusProgress = getStatusProgress(newWeeklySpent);
+
+    // Создаем покупку
+    const purchase = await Purchase.create({
+      userId: buyer.telegramId,
+      productId: reservedLines.length > 0 ? reservedLines[0].productId : null,
+      amount: amount,
+      status: 'confirmed',
+      confirmedBy: ctx.from.id
+    });
 
     // Обновляем статистику покупателя
     await buyer.update({
@@ -340,100 +305,122 @@ async function confirmSaleByAdmin(ctx, buyer, amount) {
       status: newStatus
     });
 
-    // Очищаем состояния и резервы покупателя + ОТКЛЮЧАЕМ ТОВАР
+    // ПОДТВЕРЖДАЕМ ПРОДАЖУ ЗАРЕЗЕРВИРОВАННЫХ СТРОК
+    if (reservedLines.length > 0) {
+      const productId = reservedLines[0].productId;
+      
+      // Помечаем строки как проданные
+      await LineReservationManager.confirmSale(buyer.telegramId, productId, purchase.id);
+      
+      // Создаем файл с полными данными для покупателя
+      try {
+        const fullDataFile = await LineReservationManager.createReservedLinesFile(
+          buyer.telegramId, 
+          productId
+        );
+
+        // Отправляем покупателю файл с ПОЛНЫМИ данными
+        await ctx.telegram.sendDocument(
+          buyer.telegramId,
+          { source: fullDataFile.filePath },
+          {
+            caption: `🎉 **ПОКУПКА ПОДТВЕРЖДЕНА!**\n\n` +
+              `✅ **Получены полные данные доступа**\n` +
+              `📦 **Товар:** ${reservedLines[0].Product.name}\n` +
+              `🔒 **Строк:** ${fullDataFile.count}\n` +
+              `💰 **Сумма:** $${amount}\n\n` +
+              `🔑 **В файле содержатся логины и пароли!**\n` +
+              `🏆 **Ваш статус:** ${newStatus}\n\n` +
+              `Спасибо за покупку! 🛍️`,
+            parse_mode: 'Markdown'
+          }
+        );
+
+        // Удаляем временный файл
+        setTimeout(async () => {
+          try {
+            await fs.unlink(fullDataFile.filePath);
+          } catch (cleanupError) {
+            console.error('Ошибка удаления файла:', cleanupError);
+          }
+        }, 30000); // 30 секунд
+
+      } catch (fileError) {
+        console.error('Ошибка создания файла с полными данными:', fileError);
+        await ctx.telegram.sendMessage(
+          buyer.telegramId,
+          `✅ **ПОКУПКА ПОДТВЕРЖДЕНА!**\n\n` +
+          `💰 Сумма: $${amount}\n` +
+          `🏆 Статус: ${newStatus}\n\n` +
+          `⚠️ Возникла техническая ошибка с файлом.\n` +
+          `Обратитесь к администратору: @chubakabezshersti`,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    } else {
+      // Стандартное уведомление для товаров без резервирования строк
+      try {
+        let buyerResponseText = `✅ Ваша покупка подтверждена администратором!\n\n`;
+        buyerResponseText += `💰 Сумма: ${amount}\n`;
+        buyerResponseText += `📊 Ваша статистика обновлена:\n`;
+        buyerResponseText += `💎 Потрачено за неделю: ${newWeeklySpent}\n`;
+        buyerResponseText += `💰 Всего потрачено: ${newTotalSpent}\n`;
+        buyerResponseText += `🏆 Статус: ${newStatus}\n\n`;
+        
+        if (newStatus !== oldStatus) {
+          buyerResponseText += `🎉 Поздравляем! Ваш статус повышен до ${newStatus}!\n\n`;
+        }
+        
+        // Показываем прогресс до следующего статуса
+        const statusProgress = getStatusProgress(newWeeklySpent);
+        if (statusProgress.next) {
+          const progressBar = '▓'.repeat(Math.floor(statusProgress.progress / 10)) + 
+                             '░'.repeat(10 - Math.floor(statusProgress.progress / 10));
+          buyerResponseText += `📈 Прогресс до ${statusProgress.next}:\n`;
+          buyerResponseText += `[${progressBar}] ${statusProgress.progress}%\n`;
+          buyerResponseText += `💸 Осталось потратить: ${statusProgress.needed}\n\n`;
+        } else {
+          buyerResponseText += `👑 Вы достигли максимального статуса!\n\n`;
+        }
+        
+        buyerResponseText += `Спасибо за покупку!`;
+
+        // Отправляем покупателю уведомление с обновленным меню
+        const buyerMenu = await createMainMenu(buyer.telegramId);
+        await ctx.telegram.sendMessage(buyer.telegramId, buyerResponseText, {
+          ...buyerMenu
+        });
+
+      } catch (buyerError) {
+        console.error('Ошибка уведомления покупателя:', buyerError);
+        await ctx.reply(`⚠️ Продажа подтверждена, но не удалось уведомить покупателя (ID: ${buyer.telegramId})`);
+      }
+    }
+
+    // Очищаем состояния покупателя
     userStates.delete(buyer.telegramId);
     
-    // Находим товар который купил пользователь и отключаем его
-    const purchasedProduct = await Product.findOne({
-      where: { reservedBy: buyer.telegramId }
-    });
-    
-    if (purchasedProduct) {
-      await purchasedProduct.update({
-        isAvailable: false,  // ОТКЛЮЧАЕМ ТОВАР НАВСЕГДА
-        reservedBy: null,
-        reservedUntil: null
-      });
-      console.log(`📦 Товар ${purchasedProduct.uniqueCode} отключен после продажи`);
-    }
-    
-    // Снимаем резервы с остальных товаров пользователя (если есть)
+    // Снимаем резервы с товаров
     await Product.update(
       { reservedBy: null, reservedUntil: null },
       { where: { reservedBy: buyer.telegramId } }
     );
-    
-    // Подтверждаем покупки
-    await Purchase.update(
-      { status: 'confirmed', amount: amount, confirmedBy: ctx.from.id },
-      { where: { userId: buyer.telegramId, status: 'pending' } }
-    );
 
-    // Уведомляем администратора об успешном подтверждении
+    // Ответ администратору
     let adminResponseText = `✅ ПРОДАЖА ПОДТВЕРЖДЕНА!\n\n`;
     adminResponseText += `👤 Покупатель: @${buyer.username || buyer.firstName} (ID: ${buyer.telegramId})\n`;
-    adminResponseText += `💰 Сумма продажи: ${amount}\n`;
+    adminResponseText += `💰 Сумма: $${amount}\n`;
     
-    if (purchasedProduct) {
-      adminResponseText += `📦 Проданный товар: ${purchasedProduct.name} (${purchasedProduct.uniqueCode})\n`;
-      adminResponseText += `🔒 Статус товара: Отключен навсегда\n`;
+    if (reservedLines.length > 0) {
+      adminResponseText += `🔒 Строк продано: ${reservedLines.length}\n`;
+      adminResponseText += `📦 Товар: ${reservedLines[0].Product.name}\n`;
+      adminResponseText += `📤 Покупатель получил файл с полными данными\n`;
     }
     
-    adminResponseText += `📊 Новая статистика покупателя:\n`;
-    adminResponseText += `💎 Потрачено за неделю: ${newWeeklySpent}\n`;
-    adminResponseText += `💰 Всего потрачено: ${newTotalSpent}\n`;
-    adminResponseText += `🏆 Статус: ${newStatus}\n\n`;
-    
-    if (newStatus !== oldStatus) {
-      adminResponseText += `🎉 Статус покупателя повышен с ${oldStatus} до ${newStatus}!\n\n`;
-    }
-    
-    adminResponseText += `Покупатель получит уведомление о подтвержденной покупке.`;
+    adminResponseText += `📊 Новый статус: ${newStatus}\n`;
+    adminResponseText += `💎 Всего потрачено: $${newTotalSpent}`;
 
-    // Отправляем без Markdown, чтобы избежать ошибок
-    try {
-      await ctx.reply(adminResponseText);
-    } catch (error) {
-      console.error('Ошибка отправки ответа админу:', error);
-      await ctx.reply('✅ Продажа подтверждена! (ошибка форматирования сообщения)');
-    }
-
-    // Уведомляем покупателя о подтвержденной покупке
-    try {
-      let buyerResponseText = `✅ Ваша покупка подтверждена администратором!\n\n`;
-      buyerResponseText += `💰 Сумма: ${amount}\n`;
-      buyerResponseText += `📊 Ваша статистика обновлена:\n`;
-      buyerResponseText += `💎 Потрачено за неделю: ${newWeeklySpent}\n`;
-      buyerResponseText += `💰 Всего потрачено: ${newTotalSpent}\n`;
-      buyerResponseText += `🏆 Статус: ${newStatus}\n\n`;
-      
-      if (newStatus !== oldStatus) {
-        buyerResponseText += `🎉 Поздравляем! Ваш статус повышен до ${newStatus}!\n\n`;
-      }
-      
-      // Показываем прогресс до следующего статуса
-      if (statusProgress.next) {
-        const progressBar = '▓'.repeat(Math.floor(statusProgress.progress / 10)) + 
-                           '░'.repeat(10 - Math.floor(statusProgress.progress / 10));
-        buyerResponseText += `📈 Прогресс до ${statusProgress.next}:\n`;
-        buyerResponseText += `[${progressBar}] ${statusProgress.progress}%\n`;
-        buyerResponseText += `💸 Осталось потратить: ${statusProgress.needed}\n\n`;
-      } else {
-        buyerResponseText += `👑 Вы достигли максимального статуса!\n\n`;
-      }
-      
-      buyerResponseText += `Спасибо за покупку!`;
-
-      // Отправляем покупателю уведомление с обновленным меню (без Markdown)
-      const buyerMenu = await createMainMenu(buyer.telegramId);
-      await ctx.telegram.sendMessage(buyer.telegramId, buyerResponseText, {
-        ...buyerMenu
-      });
-
-    } catch (buyerError) {
-      console.error('Ошибка уведомления покупателя:', buyerError);
-      await ctx.reply(`⚠️ Продажа подтверждена, но не удалось уведомить покупателя (ID: ${buyer.telegramId})`);
-    }
+    await ctx.reply(adminResponseText);
 
     // Уведомляем остальных админов
     const adminIds = process.env.ADMIN_IDS.split(',');
@@ -505,6 +492,9 @@ USDT (TRC20), BTC, ETH и другие по согласованию
 • **PREMIUM** - $5000+ в неделю (приоритетное обслуживание)
 • **INFINITY** - $8000+ в неделю (максимальный статус)
 
+🆕 **НОВАЯ СИСТЕМА РЕЗЕРВИРОВАНИЯ СТРОК:**
+Выберите нужные строки → они резервируются за вами → оплатите → получите полные данные!
+
 Выберите нужный раздел:`;
 
   const mainMenu = await createMainMenu(ctx.user.telegramId);
@@ -550,6 +540,18 @@ bot.command('admin_stats', async (ctx) => {
       where: { status: 'confirmed' } 
     }) || 0;
 
+    // Статистика резервов
+    const totalReservedLines = await ReservedLine.count();
+    const activeReservedLines = await ReservedLine.count({
+      where: {
+        status: 'reserved',
+        reservedUntil: { [require('sequelize').Op.gt]: new Date() }
+      }
+    });
+    const soldLines = await ReservedLine.count({
+      where: { status: 'sold' }
+    });
+
     const statsText = `📊 **Статистика бота:**
 
 👥 **Пользователи:** ${totalUsers}
@@ -557,6 +559,11 @@ bot.command('admin_stats', async (ctx) => {
 ✅ **Завершенные покупки:** ${totalPurchases}
 ⏳ **Ожидающие покупки:** ${pendingPurchases}
 💰 **Общая выручка:** $${revenue}
+
+🔒 **РЕЗЕРВЫ СТРОК:**
+📋 **Всего зарезервировано:** ${totalReservedLines}
+⚡ **Активных резервов:** ${activeReservedLines}
+✅ **Продано строк:** ${soldLines}
 
 📅 **Дата:** ${new Date().toLocaleString('ru-RU')}`;
 
@@ -694,12 +701,177 @@ bot.on('text', async (ctx, next) => {
     }
     return;
   }
+
+  // Обработка Shop списка с резервированием строк
+  if (!isAdmin) {
+    const text = ctx.message.text.trim();
+    const userState = userStates.get(ctx.user.telegramId);
+
+    // Пропускаем команды
+    if (text.startsWith('/')) {
+      console.log(`⚡ Команда ${text} пропущена обработчиком текста`);
+      return;
+    }
+
+    console.log(`📝 Обработка текста от ${ctx.user.telegramId}: "${text}"`);
+
+    // 1. НОВОЕ: Обработка Shop списка с резервированием строк
+    if (userState && userState.state === 'shop_file_sent') {
+      console.log(`🛍️ Пользователь выбирает Shop строки: ${ctx.user.telegramId}`);
+      
+      try {
+        // Парсим выбранные строки
+        const selectedLines = text.split('\n').filter(line => line.trim());
+        
+        if (selectedLines.length === 0) {
+          return ctx.reply(
+            '❌ **Пустой список**\n\n' +
+            'Отправьте строки из файла, которые хотите купить.',
+            { parse_mode: 'Markdown' }
+          );
+        }
+
+        // Показываем процесс резервирования
+        const processingMsg = await ctx.reply(
+          `⏳ **Резервирование ${selectedLines.length} строк...**\n\n` +
+          `Проверяем доступность и резервируем за вами выбранные позиции.`,
+          { parse_mode: 'Markdown' }
+        );
+
+        // РЕЗЕРВИРУЕМ СТРОКИ
+        const reservationResult = await LineReservationManager.reserveLines(
+          ctx.user.telegramId,
+          userState.productId,
+          selectedLines
+        );
+
+        if (!reservationResult.success) {
+          await ctx.telegram.editMessageText(
+            ctx.chat.id,
+            processingMsg.message_id,
+            undefined,
+            `❌ **Ошибка резервирования**\n\n${reservationResult.error}`,
+            { parse_mode: 'Markdown' }
+          );
+          return;
+        }
+
+        // Обновляем состояние пользователя
+        userStates.set(ctx.user.telegramId, {
+          ...userState,
+          state: 'shop_lines_reserved',
+          reservedCount: reservationResult.count
+        });
+
+        // Уведомляем об успешном резервировании
+        const successMenu = Markup.inlineKeyboard([
+          [Markup.button.callback('📋 Показать резерв', 'show_reserved_lines')],
+          [Markup.button.callback('💰 Товар куплен', 'purchase_completed')],
+          [Markup.button.callback('🔙 Главное меню', 'main_menu')]
+        ]);
+
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          processingMsg.message_id,
+          undefined,
+          `✅ **СТРОКИ ЗАРЕЗЕРВИРОВАНЫ!**\n\n` +
+          `🔒 **Зарезервировано:** ${reservationResult.count} строк\n` +
+          `⏰ **Резерв до:** ${reservationResult.reservedUntil.toLocaleString('ru-RU')}\n\n` +
+          `💡 **Что дальше:**\n` +
+          `• Свяжитесь с администратором для оплаты\n` +
+          `• После оплаты нажмите "💰 Товар куплен"\n` +
+          `• Получите файл с ПОЛНЫМИ данными доступа\n\n` +
+          `🔗 **Поддержка:** @chubakabezshersti`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: successMenu.reply_markup
+          }
+        );
+
+        // Уведомляем админов с подробностями
+        await sendAdminNotification(ctx,
+          `🔒 ЗАРЕЗЕРВИРОВАНЫ SHOP СТРОКИ\n\n` +
+          `👤 Пользователь: @${escapeMarkdown(ctx.user.username || ctx.user.firstName)}\n` +
+          `📱 ID: ${ctx.user.telegramId}\n` +
+          `🏆 Статус: ${ctx.user.status}\n\n` +
+          `📦 Товар: ${userState.productCode}\n` +
+          `🔒 Зарезервировано: ${reservationResult.count} строк\n` +
+          `⏰ Резерв до: ${reservationResult.reservedUntil.toLocaleString('ru-RU')}\n\n` +
+          `💬 ВЫБРАННЫЕ СТРОКИ:\n${escapeMarkdown(text)}\n\n` +
+          `💡 Свяжитесь с пользователем для завершения сделки`,
+          {},
+          true,
+          ctx.user.telegramId
+        );
+
+      } catch (error) {
+        console.error('Ошибка резервирования Shop строк:', error);
+        await ctx.reply(
+          '❌ **Произошла ошибка**\n\n' +
+          'Не удалось зарезервировать строки. Попробуйте позже.',
+          { parse_mode: 'Markdown' }
+        );
+      }
+      return;
+    }
+
+    // 2. Обработка Admin списка (как раньше)
+    if (userState && userState.state === 'admin_file_sent') {
+      const lines = text.split('\n').filter(line => line.trim());
+      const domainPattern = /^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$/;
+      
+      if (lines.length > 0 && lines.some(line => domainPattern.test(line.trim()))) {
+        userStates.set(ctx.user.telegramId, {
+          ...userState,
+          state: 'admin_list_sent',
+          userList: text,
+          listType: 'text'
+        });
+
+        const purchaseMenu = Markup.inlineKeyboard([
+          [Markup.button.callback('💰 Товар куплен', 'purchase_completed')],
+          [Markup.button.callback('🔙 Главное меню', 'main_menu')]
+        ]);
+
+        await ctx.reply(
+          `✅ **Admin список получен!**\n\n` +
+          `📝 **Количество доменов:** ${lines.length}\n\n` +
+          `Ваш список отправлен администратору.\n` +
+          `После покупки нажмите "💰 Товар куплен".`,
+          { 
+            ...purchaseMenu,
+            parse_mode: 'Markdown' 
+          }
+        );
+
+        await sendListToAdmins(ctx, userState.productCode, text, 'text', null, 'ADMIN');
+        return;
+      }
+    }
+
+    // 3. Справка
+    const helpMainMenu = await createMainMenu(ctx.user.telegramId);
+    await ctx.reply(
+      `ℹ️ **Новая система покупок!**\n\n` +
+      `🛍️ **Shop товары:**\n` +
+      `• Выберите товар → получите preview\n` +
+      `• Отправьте нужные строки → резервирование\n` +
+      `• Оплатите → получите полные данные\n\n` +
+      `👨‍💼 **Admin товары:**\n` +
+      `• Стандартный процесс с доменами\n\n` +
+      `**Резервирование гарантирует, что выбранные строки достанутся именно вам!**`,
+      { 
+        ...helpMainMenu,
+        parse_mode: 'Markdown'
+      }
+    );
+  }
   
   // Передаем обработку дальше для обычных пользователей
   return next();
 });
 
-// ==================== SHOP ТОВАРЫ ====================
+// ==================== SHOP ТОВАРЫ С РЕЗЕРВИРОВАНИЕМ ====================
 
 bot.action('buy_shop', async (ctx) => {
   try {
@@ -730,12 +902,12 @@ bot.action('buy_shop', async (ctx) => {
     productButtons.push([Markup.button.callback('🔙 Главное меню', 'main_menu')]);
 
     let messageText = `🛍️ **Покупка Shop товаров**\n\n`;
-    messageText += `📝 **Процесс покупки:**\n`;
+    messageText += `🆕 **НОВАЯ СИСТЕМА РЕЗЕРВИРОВАНИЯ:**\n`;
     messageText += `• Выберите товар из списка ниже\n`;
-    messageText += `• Получите файл с анализом магазинов\n`;
-    messageText += `• Загрузите свой список или напишите в чат\n`;
-    messageText += `• Администратор получит ваш список\n`;
-    messageText += `• После покупки нажмите "Товар куплен"\n\n`;
+    messageText += `• Получите preview файл (логины скрыты)\n`;
+    messageText += `• Выберите нужные строки\n`;
+    messageText += `• Строки резервируются ЗА ВАМИ\n`;
+    messageText += `• После оплаты получите ПОЛНЫЕ данные\n\n`;
     
     messageText += `📊 **Доступно товаров: ${products.length}**\n\n`;
     messageText += `Выберите товар:`;
@@ -782,43 +954,40 @@ bot.action(/shop_product_(\d+)/, async (ctx) => {
       productCode: product.uniqueCode
     });
 
-    // Отправляем файл с анализом
+    // Отправляем файл с анализом (СКРЫТЫЕ логины/пароли)
     try {
-      // Читаем файл и обрабатываем строки (скрываем логины/пароли)
       let fileContent = '';
       let processedContent = '';
       
       try {
         fileContent = await fs.readFile(product.filePath, 'utf8');
-        const processedLines = processFileLines(fileContent, true);
+        const processedLines = LineReservationManager.processFileLines(fileContent, true);
         processedContent = processedLines.join('\n');
       } catch (fileError) {
         console.error('Ошибка чтения файла товара:', fileError);
         processedContent = 'Ошибка загрузки данных товара';
       }
 
-      // Создаем временный файл с обработанными данными для отправки
-      const tempFileName = `temp_${product.uniqueCode}_${Date.now()}.txt`;
+      // Создаем временный файл с обработанными данными
+      const tempFileName = `preview_${product.uniqueCode}_${Date.now()}.txt`;
       const tempFilePath = path.join(__dirname, 'temp', tempFileName);
       
-      // Создаем папку temp если не существует
       await fs.mkdir(path.join(__dirname, 'temp'), { recursive: true });
       await fs.writeFile(tempFilePath, processedContent, 'utf8');
 
       await ctx.replyWithDocument(
         { source: tempFilePath },
         {
-          caption: `🛍️ **Анализ Shop товара: ${product.name}**\n\n` +
-            `📝 **Инструкция:**\n` +
-            `1. Изучите список магазинов в прикрепленном файле\n` +
-            `2. Выберите нужные строки и отправьте их боту\n` +
-            `3. Можете загрузить TXT файл или написать в чат:\n` +
-            `   \`строка1\`\n` +
-            `   \`строка2\`\n` +
-            `   \`строка3\`\n\n` +
-            `⚠️ **Важно:** Логины и пароли скрыты для безопасности\n` +
-            `💰 После оплаты вы получите полные данные доступа\n` +
-            `⏰ **Резерв до:** ${reserveUntil.toLocaleString('ru-RU')}`,
+          caption: `🛍️ **SHOP товар: ${product.name}**\n\n` +
+            `🆕 **НОВЫЙ ПРОЦЕСС С РЕЗЕРВИРОВАНИЕМ:**\n` +
+            `1️⃣ Изучите список магазинов в файле\n` +
+            `2️⃣ Скопируйте нужные строки и отправьте их боту\n` +
+            `3️⃣ Строки будут ЗАРЕЗЕРВИРОВАНЫ за вами\n` +
+            `4️⃣ После оплаты получите ПОЛНЫЕ данные\n\n` +
+            `⚠️ **ВАЖНО:** Логины/пароли скрыты для безопасности\n` +
+            `💰 После покупки получите полные доступы\n` +
+            `⏰ **Резерв до:** ${reserveUntil.toLocaleString('ru-RU')}\n\n` +
+            `**Отправьте выбранные строки в следующем сообщении:**`,
           parse_mode: 'Markdown'
         }
       );
@@ -833,7 +1002,6 @@ bot.action(/shop_product_(\d+)/, async (ctx) => {
       }, 5000);
 
       // Уведомляем админов
-      console.log(`🛍️ Отправка уведомления о запросе Shop товара...`);
       await sendAdminNotification(ctx,
         `🛍️ ЗАПРОС SHOP ТОВАРА\n\n` +
         `👤 Пользователь: @${escapeMarkdown(ctx.user.username || ctx.user.firstName)}\n` +
@@ -841,19 +1009,17 @@ bot.action(/shop_product_(\d+)/, async (ctx) => {
         `🏆 Статус: ${ctx.user.status}\n\n` +
         `📦 Товар: ${escapeMarkdown(product.name)}\n` +
         `🔗 Код: ${product.uniqueCode}\n` +
-        `📁 Файл отправлен пользователю (логины/пароли скрыты)\n` +
-        `⏰ Резерв до: ${reserveUntil.toLocaleString('ru-RU')}`,
+        `📁 Preview файл отправлен (логины/пароли скрыты)\n` +
+        `⏰ Резерв до: ${reserveUntil.toLocaleString('ru-RU')}\n\n` +
+        `💡 Пользователь выберет строки для резервирования`,
         {},
-        true,
+        false,
         ctx.user.telegramId
       );
 
     } catch (error) {
       console.error('Ошибка отправки файла:', error);
-      await ctx.reply(
-        '❌ **Ошибка отправки файла**\n\n' +
-        'Файл анализа недоступен. Обратитесь к администратору.'
-      );
+      await ctx.reply('❌ **Ошибка отправки файла**\n\nОбратитесь к администратору.');
     }
 
   } catch (error) {
@@ -893,7 +1059,7 @@ bot.action('buy_admin', async (ctx) => {
     productButtons.push([Markup.button.callback('🔙 Главное меню', 'main_menu')]);
 
     let messageText = `👨‍💼 **Покупка Admin товаров**\n\n`;
-    messageText += `📝 **Новый процесс покупки:**\n`;
+    messageText += `📝 **Процесс покупки:**\n`;
     messageText += `• Выберите товар из списка ниже\n`;
     messageText += `• Получите файл с анализом посещаемости\n`;
     messageText += `• Загрузите свой список или напишите в чат\n`;
@@ -963,8 +1129,7 @@ bot.action(/admin_product_(\d+)/, async (ctx) => {
         }
       );
 
-      // Уведомляем админов с улучшенным логированием
-      console.log(`📊 Отправка уведомления о запросе Admin товара...`);
+      // Уведомляем админов
       await sendAdminNotification(ctx,
         `📊 ЗАПРОС ADMIN ТОВАРА\n\n` +
         `👤 Пользователь: @${escapeMarkdown(ctx.user.username || ctx.user.firstName)}\n` +
@@ -981,10 +1146,7 @@ bot.action(/admin_product_(\d+)/, async (ctx) => {
 
     } catch (error) {
       console.error('Ошибка отправки файла:', error);
-      await ctx.reply(
-        '❌ **Ошибка отправки файла**\n\n' +
-        'Файл анализа недоступен. Обратитесь к администратору.'
-      );
+      await ctx.reply('❌ **Ошибка отправки файла**\n\nОбратитесь к администратору.');
     }
 
   } catch (error) {
@@ -993,7 +1155,7 @@ bot.action(/admin_product_(\d+)/, async (ctx) => {
   }
 });
 
-// ==================== ОБРАБОТКА ФАЙЛОВ И ТЕКСТА ====================
+// ==================== ОБРАБОТКА ФАЙЛОВ ====================
 
 // Обработка загруженных файлов
 bot.on('document', async (ctx) => {
@@ -1011,7 +1173,7 @@ bot.on('document', async (ctx) => {
       const file = await ctx.telegram.getFile(ctx.message.document.file_id);
       const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
       
-      // Скачиваем и читаем содержимое (для небольших файлов)
+      // Скачиваем и читаем содержимое
       const response = await fetch(fileUrl);
       const fileContent = await response.text();
 
@@ -1056,110 +1218,66 @@ bot.on('document', async (ctx) => {
   }
 });
 
-// ==================== ОБЪЕДИНЕННЫЙ ОБРАБОТЧИК ТЕКСТА ====================
+// ==================== НОВЫЕ ОБРАБОТЧИКИ КНОПОК ====================
 
-bot.on('text', async (ctx) => {
-  const text = ctx.message.text.trim();
-  const userState = userStates.get(ctx.user.telegramId);
-
-  // Пропускаем команды - они обрабатываются отдельными обработчиками
-  if (text.startsWith('/')) {
-    console.log(`⚡ Команда ${text} пропущена обработчиком текста`);
-    return;
-  }
-
-  console.log(`📝 Обработка текста от ${ctx.user.telegramId}: "${text}"`);
-  console.log(`📊 Состояние пользователя:`, userState);
-
-  // 1. Обработка Shop списка (новый приоритет)
-  if (userState && userState.state === 'shop_file_sent') {
-    console.log(`🛍️ Пользователь в режиме ожидания Shop списка от ${ctx.user.telegramId}`);
-    
-    // Любой текст от пользователя в этом состоянии считается списком магазинов
-    userStates.set(ctx.user.telegramId, {
-      ...userState,
-      state: 'shop_list_sent',
-      userList: text,
-      listType: 'text'
+// Показать зарезервированные строки
+bot.action('show_reserved_lines', async (ctx) => {
+  try {
+    const reservedLines = await ReservedLine.findAll({
+      where: {
+        userId: ctx.user.telegramId,
+        status: 'reserved',
+        reservedUntil: { [require('sequelize').Op.gt]: new Date() }
+      },
+      include: [Product],
+      order: [['createdAt', 'DESC']]
     });
 
-    const purchaseMenu = Markup.inlineKeyboard([
-      [Markup.button.callback('💰 Товар куплен', 'purchase_completed')],
-      [Markup.button.callback('🔙 Главное меню', 'main_menu')]
-    ]);
+    if (reservedLines.length === 0) {
+      return ctx.answerCbQuery('❌ У вас нет активных резервов');
+    }
 
-    await ctx.reply(
-      `✅ **Список получен!**\n\n` +
-      `📝 **Количество строк:** ${text.split('\n').filter(line => line.trim()).length}\n\n` +
-      `Ваш список отправлен администратору для обработки.\n\n` +
-      `💬 **Что дальше?**\n` +
-      `Администратор свяжется с вами для завершения сделки.\n` +
-      `После получения товара нажмите "💰 Товар куплен".`,
-      { 
-        ...purchaseMenu,
-        parse_mode: 'Markdown' 
+    // Группируем по товарам
+    const byProducts = {};
+    reservedLines.forEach(line => {
+      const productId = line.productId;
+      if (!byProducts[productId]) {
+        byProducts[productId] = {
+          product: line.Product,
+          lines: [],
+          count: 0
+        };
       }
-    );
+      byProducts[productId].lines.push(line);
+      byProducts[productId].count++;
+    });
 
-    await sendListToAdmins(ctx, userState.productCode, text, 'text', null, 'SHOP');
-    return;
-  }
-
-  // 2. Обработка Admin списка
-  if (userState && userState.state === 'admin_file_sent') {
-    const lines = text.split('\n').filter(line => line.trim());
-    const domainPattern = /^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9]\.[a-zA-Z]{2,}$/;
+    let reserveText = `📋 **ВАШИ ЗАРЕЗЕРВИРОВАННЫЕ СТРОКИ**\n\n`;
     
-    if (lines.length > 0 && lines.some(line => domainPattern.test(line.trim()))) {
-      console.log(`📝 Обнаружен список доменов от ${ctx.user.telegramId}`);
+    Object.values(byProducts).forEach(productData => {
+      reserveText += `📦 **${productData.product.name}**\n`;
+      reserveText += `🔒 Строк: ${productData.count}\n`;
+      reserveText += `⏰ До: ${productData.lines[0].reservedUntil.toLocaleString('ru-RU')}\n\n`;
       
-      userStates.set(ctx.user.telegramId, {
-        ...userState,
-        state: 'admin_list_sent',
-        userList: text,
-        listType: 'text'
+      productData.lines.slice(0, 3).forEach((line, index) => {
+        reserveText += `${index + 1}. ${line.processedContent.slice(0, 80)}...\n`;
       });
+      
+      if (productData.count > 3) {
+        reserveText += `... и еще ${productData.count - 3} строк\n`;
+      }
+      reserveText += `\n`;
+    });
+    
+    reserveText += `💡 После оплаты получите файл с полными данными!`;
 
-      const purchaseMenu = Markup.inlineKeyboard([
-        [Markup.button.callback('💰 Товар куплен', 'purchase_completed')],
-        [Markup.button.callback('🔙 Главное меню', 'main_menu')]
-      ]);
+    await ctx.reply(reserveText, { parse_mode: 'Markdown' });
+    await ctx.answerCbQuery('✅ Показаны зарезервированные строки');
 
-      await ctx.reply(
-        `✅ **Список получен!**\n\n` +
-        `📝 **Количество строк:** ${lines.length}\n\n` +
-        `Ваш список отправлен администратору для обработки.\n\n` +
-        `💬 **Что дальше?**\n` +
-        `Администратор свяжется с вами для завершения сделки.\n` +
-        `После получения товара нажмите "💰 Товар куплен".`,
-        { 
-          ...purchaseMenu,
-          parse_mode: 'Markdown' 
-        }
-      );
-
-      await sendListToAdmins(ctx, userState.productCode, text, 'text', null, 'ADMIN');
-      return;
-    }
+  } catch (error) {
+    console.error('Ошибка показа резерва:', error);
+    await ctx.answerCbQuery('❌ Ошибка загрузки резерва');
   }
-
-  // 3. Справка по командам
-  console.log(`ℹ️ Отправка справки пользователю ${ctx.user.telegramId}`);
-  const helpMainMenu = await createMainMenu(ctx.user.telegramId);
-  await ctx.reply(
-    `ℹ️ **Доступные команды:**\n\n` +
-    `/start - Главное меню\n` +
-    `/help - Эта справка\n\n` +
-    `**Для покупки товаров:**\n` +
-    `• Используйте кнопки в разделах Shop/Admin\n` +
-    `• Выбирайте товар из списка кнопок\n` +
-    `• Отправляйте списки или файлы как указано\n\n` +
-    `**Новый процесс покупки более удобный и безопасный!**`,
-    { 
-      ...helpMainMenu,
-      parse_mode: 'Markdown'
-    }
-  );
 });
 
 // ==================== ПОДТВЕРЖДЕНИЕ ПОКУПКИ ПОЛЬЗОВАТЕЛЕМ ====================
@@ -1181,11 +1299,19 @@ bot.action('purchase_completed', async (ctx) => {
       }
     });
 
+    const hasReservedLines = await ReservedLine.findOne({
+      where: {
+        userId: ctx.user.telegramId,
+        status: 'reserved',
+        reservedUntil: { [require('sequelize').Op.gt]: new Date() }
+      }
+    });
+
     const userState = userStates.get(ctx.user.telegramId);
     const hasAdminProcess = userState && (userState.state === 'admin_list_sent' || userState.state === 'admin_file_sent');
-    const hasShopProcess = userState && (userState.state === 'shop_list_sent' || userState.state === 'shop_file_sent');
+    const hasShopProcess = userState && (userState.state === 'shop_list_sent' || userState.state === 'shop_file_sent' || userState.state === 'shop_lines_reserved');
 
-    if (!hasActiveReservation && !hasPendingPurchase && !hasAdminProcess && !hasShopProcess) {
+    if (!hasActiveReservation && !hasPendingPurchase && !hasAdminProcess && !hasShopProcess && !hasReservedLines) {
       return ctx.reply(
         `❌ **Нет активных покупок**\n\n` +
         `У вас нет активных резервов или покупок для подтверждения.\n` +
@@ -1312,13 +1438,22 @@ bot.action('profile', async (ctx) => {
       include: [Product]
     });
 
+    const reservedLinesStats = await LineReservationManager.getUserReservationStats(ctx.user.telegramId);
     const statusProgress = getStatusProgress(ctx.user.weeklySpent || 0);
 
     let profileText = `👤 **Ваш личный кабинет**\n\n`;
     profileText += `🏆 Статус: **${ctx.user.status}**\n`;
-    profileText += `💰 Потрачено за неделю: **$${ctx.user.weeklySpent || 0}**\n`;
-    profileText += `💎 Всего потрачено: **$${ctx.user.totalSpent || 0}**\n`;
+    profileText += `💰 Потрачено за неделю: **${ctx.user.weeklySpent || 0}**\n`;
+    profileText += `💎 Всего потрачено: **${ctx.user.totalSpent || 0}**\n`;
     profileText += `🛒 Количество покупок: **${purchases.length}**\n\n`;
+    
+    // Статистика резервов
+    if (reservedLinesStats.total > 0) {
+      profileText += `📋 **РЕЗЕРВЫ СТРОК:**\n`;
+      profileText += `🔒 Зарезервировано: ${reservedLinesStats.reserved}\n`;
+      profileText += `✅ Куплено: ${reservedLinesStats.sold}\n`;
+      profileText += `⏰ Истекло: ${reservedLinesStats.expired}\n\n`;
+    }
     
     // Показываем прогресс до следующего статуса
     if (statusProgress.next) {
@@ -1326,7 +1461,7 @@ bot.action('profile', async (ctx) => {
                          '░'.repeat(10 - Math.floor(statusProgress.progress / 10));
       profileText += `📈 **Прогресс до ${statusProgress.next}:**\n`;
       profileText += `[${progressBar}] ${statusProgress.progress}%\n`;
-      profileText += `💸 Осталось потратить: $${statusProgress.needed}\n\n`;
+      profileText += `💸 Осталось потратить: ${statusProgress.needed}\n\n`;
     } else {
       profileText += `👑 **Вы достигли максимального статуса!**\n\n`;
     }
@@ -1334,12 +1469,13 @@ bot.action('profile', async (ctx) => {
     profileText += `📊 **Система статусов:**\n`;
     profileText += `• **Пыль** - до $2000 в неделю\n`;
     profileText += `• **VIP** - $2000+ в неделю\n`;
+    profileText += `• **PREMIUM** - $5000+ в неделю\n`;
     profileText += `• **INFINITY** - $8000+ в неделю (максимум)\n\n`;
 
     if (purchases.length > 0) {
       profileText += `📦 **Ваши покупки:**\n`;
       purchases.slice(0, 5).forEach(p => {
-        profileText += `• ${p.Product.name} - ${p.amount}\n`;
+        profileText += `• ${p.Product?.name || 'Неизвестный товар'} - ${p.amount}\n`;
       });
       if (purchases.length > 5) {
         profileText += `... и еще ${purchases.length - 5} покупок\n`;
@@ -1378,7 +1514,11 @@ bot.action('support', async (ctx) => {
     supportText += `Для связи с администратором используйте:\n\n`;
     supportText += `👨‍💼 **Поддержка:** @chubakabezshersti\n\n`;
     supportText += `📞 Администратор ответит в личных сообщениях в ближайшее время.\n`;
-    supportText += `🕐 Время ответа: обычно в течение 30 минут.`;
+    supportText += `🕐 Время ответа: обычно в течение 30 минут.\n\n`;
+    supportText += `🆕 **НОВАЯ СИСТЕМА РЕЗЕРВИРОВАНИЯ:**\n`;
+    supportText += `• Строки резервируются только за вами\n`;
+    supportText += `• Полные данные после оплаты\n`;
+    supportText += `• Гарантия получения выбранных позиций`;
 
     // Создаем меню только с кнопкой возврата
     const supportMenu = Markup.inlineKeyboard([
@@ -1407,7 +1547,11 @@ bot.action('support', async (ctx) => {
           `Для связи с администратором используйте:\n\n` +
           `👨‍💼 Поддержка: @chubakabezshersti\n\n` +
           `📞 Администратор ответит в личных сообщениях в ближайшее время.\n` +
-          `🕐 Время ответа: обычно в течение 30 минут.`;
+          `🕐 Время ответа: обычно в течение 30 минут.\n\n` +
+          `🆕 НОВАЯ СИСТЕМА РЕЗЕРВИРОВАНИЯ:\n` +
+          `• Строки резервируются только за вами\n` +
+          `• Полные данные после оплаты\n` +
+          `• Гарантия получения выбранных позиций`;
           
         await ctx.editMessageText(plainText, supportMenu);
       } catch (finalError) {
@@ -1426,6 +1570,7 @@ bot.action('support', async (ctx) => {
 
 setInterval(async () => {
   try {
+    // Очищаем истекшие резервы товаров
     const expiredReservations = await Product.findAll({
       where: {
         reservedBy: { [require('sequelize').Op.not]: null },
@@ -1440,10 +1585,14 @@ setInterval(async () => {
       });
       console.log(`⏰ Снят резерв с товара ${product.uniqueCode}`);
     }
+
+    // Очищаем истекшие резервы строк
+    const expiredLinesCount = await LineReservationManager.cleanExpiredReserves();
+    
   } catch (error) {
-    console.error('Ошибка снятия резерва:', error);
+    console.error('Ошибка автоочистки:', error);
   }
-}, 60000);
+}, 60000); // Каждую минуту
 
 // ==================== ЗАПУСК БОТА ====================
 
@@ -1455,6 +1604,7 @@ async function startBot() {
     
     await bot.launch();
     console.log('✅ Бот успешно запущен!');
+    console.log('🆕 НОВАЯ СИСТЕМА РЕЗЕРВИРОВАНИЯ СТРОК АКТИВНА!');
     console.log(`🌐 Админ-панель будет доступна на: http://localhost:${process.env.ADMIN_PANEL_PORT || 3001}`);
     console.log(`🔗 Бот: @${(await bot.telegram.getMe()).username}`);
     console.log(`👨‍💼 Админы: ${process.env.ADMIN_IDS}`);
